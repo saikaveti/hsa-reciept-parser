@@ -515,6 +515,9 @@ def process_folder(
 
 
 def main() -> int:
+    from dotenv import load_dotenv
+
+    load_dotenv()
     parser = argparse.ArgumentParser(
         description="OCR receipt images in Google Drive and append review rows to Google Sheets."
     )
