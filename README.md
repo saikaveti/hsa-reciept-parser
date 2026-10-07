@@ -16,7 +16,7 @@ Supported inputs are PDF and common image formats (BMP, GIF, JPEG, PNG, TIFF, an
 
 1. Install Python 3.10 or newer and [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) for Windows. Note the Tesseract executable path if it is not on `PATH`.
 2. In Google Cloud Console, create a project and enable the Google Drive API and Google Sheets API.
-3. Configure the OAuth consent screen for your account, then create an OAuth client ID of type **Desktop app**. Download its JSON file into this directory as `credentials.json`. The credentials and generated `token.json` are ignored by Git.
+3. Configure the OAuth consent screen for your account, then create an OAuth client ID of type **Desktop app**. Download its JSON file. By default, save it in this directory as `credentials.json`; alternatively, set `GOOGLE_OAUTH_CREDENTIALS_FILE` in `.env` to its local path. The credentials and generated `token.json` are ignored by Git.
 4. Install the Python dependencies:
 
    ```powershell

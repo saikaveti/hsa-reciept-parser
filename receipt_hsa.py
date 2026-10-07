@@ -532,7 +532,11 @@ def main() -> int:
         help="Google spreadsheet ID or URL (or GOOGLE_SHEETS_ID).",
     )
     parser.add_argument("--worksheet", default="Receipts", help="Worksheet tab name.")
-    parser.add_argument("--credentials", default="credentials.json", help="OAuth client JSON file.")
+    parser.add_argument(
+        "--credentials",
+        default=os.getenv("GOOGLE_OAUTH_CREDENTIALS_FILE", "credentials.json"),
+        help="OAuth client JSON file (or GOOGLE_OAUTH_CREDENTIALS_FILE).",
+    )
     parser.add_argument("--token", default="token.json", help="Local OAuth token cache file.")
     parser.add_argument("--language", default="eng", help="Tesseract language code.")
     parser.add_argument("--tesseract-cmd", help="Optional path to the Tesseract executable.")
