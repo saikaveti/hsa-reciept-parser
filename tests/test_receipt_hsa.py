@@ -48,6 +48,18 @@ Grand Total $12.50
         self.assertEqual(row[2], "Clinic")
         self.assertEqual(row[3], "Copay")
 
+    def test_ocr_text_is_retained_in_its_sheet_column(self):
+        row = parse_receipt_text(
+            "Clinic\nTotal $20.00",
+            "receipt.jpg",
+            1,
+            "file-1:page:1",
+            "https://drive.google.com/file/d/file-1/view",
+        )
+
+        self.assertEqual(row[12], "Clinic\nTotal $20.00")
+        self.assertEqual(row[13], "https://drive.google.com/file/d/file-1/view")
+
     def test_unknown_merchant_is_flagged(self):
         row = parse_receipt_text("", "scan.png", 1, "file-2:page:1", "")
 
@@ -182,7 +194,7 @@ Grand Total $12.50
         sheets = MagicMock()
         api = sheets.spreadsheets.return_value
         api.get.return_value.execute.return_value = {
-            "sheets": [{"properties": {"title": "Receipts"}}]
+            "sheets": [{"properties": {"title": "Receipts", "sheetId": 42}}]
         }
         values_api = api.values.return_value
 
@@ -203,6 +215,15 @@ Grand Total $12.50
         append_call = values_api.append.call_args.kwargs
         self.assertEqual(append_call["range"], "'Receipts'!A:N")
         self.assertIn("POTENTIAL DUPLICATE", append_call["body"]["values"][0][10])
+        formatting = api.batchUpdate.call_args.kwargs["body"]["requests"]
+        self.assertEqual(
+            formatting[0]["updateDimensionProperties"]["properties"]["pixelSize"],
+            21,
+        )
+        self.assertEqual(
+            formatting[1]["repeatCell"]["cell"]["userEnteredFormat"]["wrapStrategy"],
+            "CLIP",
+        )
 
     def test_sheet_sync_skips_an_already_imported_page(self):
         existing = [
@@ -224,7 +245,7 @@ Grand Total $12.50
         sheets = MagicMock()
         api = sheets.spreadsheets.return_value
         api.get.return_value.execute.return_value = {
-            "sheets": [{"properties": {"title": "Receipts"}}]
+            "sheets": [{"properties": {"title": "Receipts", "sheetId": 42}}]
         }
         values_api = api.values.return_value
 

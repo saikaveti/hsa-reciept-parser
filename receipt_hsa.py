@@ -417,14 +417,20 @@ def quoted_sheet_range(worksheet: str, cells: str) -> str:
     return f"'{worksheet.replace(chr(39), chr(39) * 2)}'!{cells}"
 
 
-def ensure_worksheet(sheets: Any, spreadsheet_id: str, worksheet: str) -> None:
+def ensure_worksheet(sheets: Any, spreadsheet_id: str, worksheet: str) -> int:
     spreadsheet = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    titles = [sheet["properties"]["title"] for sheet in spreadsheet.get("sheets", [])]
-    if worksheet not in titles:
-        sheets.spreadsheets().batchUpdate(
+    sheet_properties = {
+        sheet["properties"]["title"]: sheet["properties"]
+        for sheet in spreadsheet.get("sheets", [])
+    }
+    if worksheet in sheet_properties:
+        sheet_id = sheet_properties[worksheet]["sheetId"]
+    else:
+        response = sheets.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"requests": [{"addSheet": {"properties": {"title": worksheet}}}]},
         ).execute()
+        sheet_id = response["replies"][0]["addSheet"]["properties"]["sheetId"]
     header_range = quoted_sheet_range(worksheet, "A1:N1")
     result = (
         sheets.spreadsheets()
@@ -444,10 +450,11 @@ def ensure_worksheet(sheets: Any, spreadsheet_id: str, worksheet: str) -> None:
         raise ValueError(
             f"Worksheet {worksheet!r} has different headers; use an empty worksheet or rename it."
         )
+    return sheet_id
 
 
 def sync_rows(sheets: Any, spreadsheet_id: str, worksheet: str, new_rows: list[list[Any]]) -> int:
-    ensure_worksheet(sheets, spreadsheet_id, worksheet)
+    sheet_id = ensure_worksheet(sheets, spreadsheet_id, worksheet)
     data_range = quoted_sheet_range(worksheet, "A2:N")
     existing_rows = (
         sheets.spreadsheets()
@@ -487,6 +494,39 @@ def sync_rows(sheets: Any, spreadsheet_id: str, worksheet: str, new_rows: list[l
             insertDataOption="INSERT_ROWS",
             body={"values": prepared_rows},
         ).execute()
+    used_row_count = max(1, len(existing_rows) + len(prepared_rows) + 1)
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "requests": [
+                {
+                    "updateDimensionProperties": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": 0,
+                            "endIndex": used_row_count,
+                        },
+                        "properties": {"pixelSize": 21},
+                        "fields": "pixelSize",
+                    }
+                },
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startColumnIndex": 12,
+                            "endColumnIndex": 13,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {"wrapStrategy": "CLIP"}
+                        },
+                        "fields": "userEnteredFormat.wrapStrategy",
+                    }
+                },
+            ]
+        },
+    ).execute()
     return len(prepared_rows)
 
 

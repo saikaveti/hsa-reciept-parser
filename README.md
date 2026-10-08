@@ -6,7 +6,7 @@ The program is an organizer, not an HSA eligibility decision-maker. OCR can be w
 
 ## What it records
 
-The `Receipts` worksheet contains service date, receipt date, provider, description, amount, currency, patient, HSA category, source file, page, review flags, a source key, OCR text, and a link to the Drive file. Service date, patient, and HSA category are not guessed when they cannot be reliably determined; the sheet flags them for review or leaves the entry blank.
+The `Receipts` worksheet contains service date, receipt date, provider, description, amount, currency, patient, HSA category, source file, page, review flags, a source key, OCR text, and a link to the Drive file. OCR text is retained but clipped in the cell, and used rows are kept at a fixed height. Service date, patient, and HSA category are not guessed when they cannot be reliably determined; the sheet flags them for review or leaves the entry blank.
 
 Rows are flagged when a date, provider, description, or amount needs review. A zero amount gets `ZERO AMOUNT`. Rows with the same receipt date and amount get `POTENTIAL DUPLICATE`; both the new and existing rows are flagged. Each Drive file page has a stable source key, so rerunning the tool skips pages already in the sheet.
 
