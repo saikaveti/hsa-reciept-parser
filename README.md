@@ -35,7 +35,9 @@ On first run, the program opens a browser window for Google OAuth consent. The t
   --sheet "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
 ```
 
-The worksheet tab defaults to `Receipts` and is created with the expected headers if it does not exist. If it already exists with different headers, the program stops rather than overwriting it. Tesseract uses English by default; specify `--language` for another installed Tesseract language or `--tesseract-cmd "C:\path\to\tesseract.exe"` if Tesseract is not on `PATH`.
+The worksheet tab defaults to `Receipts` and is created with the expected headers if it does not exist. If it already exists with different headers, the program stops rather than overwriting it. Tesseract uses English by default; specify `--language` for another installed Tesseract language or set `TESSERACT_CMD` in `.env` (or pass `--tesseract-cmd`) if Tesseract is not on `PATH`.
+
+The Drive folder must be accessible to the Google account used during OAuth. If Drive reports that the folder cannot be found, verify the folder ID and share it with that account; the program stops before writing to Sheets.
 
 Folder and spreadsheet IDs can also be supplied through `GOOGLE_DRIVE_FOLDER_ID` and `GOOGLE_SHEETS_ID` environment variables.
 For local setup, copy `.env.example` to `.env` and set those values there; `.env` is ignored by Git.

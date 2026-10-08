@@ -1,9 +1,11 @@
 import io
 import unittest
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pymupdf
+from googleapiclient.errors import HttpError
 
 from receipt_hsa import (
     HEADERS,
@@ -14,6 +16,7 @@ from receipt_hsa import (
     normalize_folder_id,
     parse_receipt_text,
     sync_rows,
+    validate_drive_folder,
 )
 
 
@@ -122,6 +125,26 @@ Grand Total $12.50
         pages = list(extract_page_images(pdf_bytes, "application/pdf"))
 
         self.assertEqual(len(pages), 2)
+
+    def test_inaccessible_drive_folder_reports_account_access(self):
+        drive = MagicMock()
+        drive.files.return_value.get.return_value.execute.side_effect = HttpError(
+            SimpleNamespace(status=404, reason="Not Found"),
+            b"File not found",
+        )
+
+        with self.assertRaisesRegex(ValueError, "not accessible to the Google account"):
+            validate_drive_folder(drive, "folder-id")
+
+    def test_drive_folder_validation_rejects_non_folder_ids(self):
+        drive = MagicMock()
+        drive.files.return_value.get.return_value.execute.return_value = {
+            "id": "file-id",
+            "mimeType": "application/pdf",
+        }
+
+        with self.assertRaisesRegex(ValueError, "not a folder"):
+            validate_drive_folder(drive, "file-id")
 
     def test_sheet_sync_flags_existing_duplicate_and_appends_new_row(self):
         existing = [

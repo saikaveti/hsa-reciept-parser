@@ -364,6 +364,8 @@ def list_drive_files(drive: Any, root_folder_id: str) -> list[dict[str, str]]:
                     fields="nextPageToken,files(id,name,mimeType,webViewLink)",
                     pageSize=1000,
                     pageToken=page_token,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
                 )
                 .execute()
             )
@@ -376,6 +378,27 @@ def list_drive_files(drive: Any, root_folder_id: str) -> list[dict[str, str]]:
             if not page_token:
                 break
     return files
+
+
+def validate_drive_folder(drive: Any, folder_id: str) -> None:
+    from googleapiclient.errors import HttpError
+
+    try:
+        metadata = (
+            drive.files()
+            .get(fileId=folder_id, fields="id,mimeType", supportsAllDrives=True)
+            .execute()
+        )
+    except HttpError as error:
+        if error.resp.status == 404:
+            raise ValueError(
+                "The Drive folder was not found or is not accessible to the Google "
+                "account that authorized this app. Verify the folder ID and share "
+                "the folder with that account."
+            ) from error
+        raise
+    if metadata.get("mimeType") != FOLDER_MIME_TYPE:
+        raise ValueError("The supplied Drive ID is not a folder.")
 
 
 def download_drive_file(drive: Any, file_id: str) -> bytes:
@@ -539,7 +562,11 @@ def main() -> int:
     )
     parser.add_argument("--token", default="token.json", help="Local OAuth token cache file.")
     parser.add_argument("--language", default="eng", help="Tesseract language code.")
-    parser.add_argument("--tesseract-cmd", help="Optional path to the Tesseract executable.")
+    parser.add_argument(
+        "--tesseract-cmd",
+        default=os.getenv("TESSERACT_CMD"),
+        help="Optional path to the Tesseract executable (or TESSERACT_CMD).",
+    )
     args = parser.parse_args()
     if not args.folder or not args.sheet:
         parser.error("--folder and --sheet are required (or set their environment variables).")
@@ -555,6 +582,7 @@ def main() -> int:
             pytesseract.pytesseract.tesseract_cmd = args.tesseract_cmd
         credentials = authenticate(Path(args.credentials), Path(args.token))
         drive, sheets = build_services(credentials)
+        validate_drive_folder(drive, folder_id)
         records = process_folder(drive, folder_id, args.language)
         added = sync_rows(sheets, spreadsheet_id, args.worksheet, records)
     except Exception as error:
