@@ -26,7 +26,9 @@ HEADERS = [
     "Source Key",
     "OCR Text",
     "Source URL",
+    "Document Page Link",
 ]
+LEGACY_HEADERS = HEADERS[:-1]
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
@@ -195,6 +197,15 @@ def extract_description(text: str, merchant: str) -> str:
     return "; ".join(descriptions)[:240]
 
 
+def build_document_page_link(source_url: str, page_number: int, mime_type: str) -> str:
+    if not source_url:
+        return ""
+    base_url = source_url.split("#", 1)[0]
+    if mime_type == "application/pdf":
+        return f"{base_url}#page={page_number}"
+    return base_url
+
+
 def add_flag(flags: str, flag: str) -> str:
     current = [part for part in flags.split("; ") if part]
     if flag not in current:
@@ -208,6 +219,7 @@ def parse_receipt_text(
     page_number: int,
     source_key: str,
     source_url: str,
+    document_page_link: str = "",
 ) -> list[Any]:
     service_date = extract_service_date(text)
     receipt_date = extract_date(text)
@@ -244,6 +256,7 @@ def parse_receipt_text(
         source_key,
         text.strip(),
         source_url,
+        document_page_link,
     ]
 
 
@@ -431,7 +444,7 @@ def ensure_worksheet(sheets: Any, spreadsheet_id: str, worksheet: str) -> int:
             body={"requests": [{"addSheet": {"properties": {"title": worksheet}}}]},
         ).execute()
         sheet_id = response["replies"][0]["addSheet"]["properties"]["sheetId"]
-    header_range = quoted_sheet_range(worksheet, "A1:N1")
+    header_range = quoted_sheet_range(worksheet, "A1:O1")
     result = (
         sheets.spreadsheets()
         .values()
@@ -439,6 +452,20 @@ def ensure_worksheet(sheets: Any, spreadsheet_id: str, worksheet: str) -> int:
         .execute()
     )
     current_headers = result.get("values", [[]])[0]
+    if current_headers == LEGACY_HEADERS:
+        sheets.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=quoted_sheet_range(worksheet, "O1"),
+            valueInputOption="RAW",
+            body={"values": [[HEADERS[-1]]]},
+        ).execute()
+        current_headers = (
+            sheets.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id, range=header_range)
+            .execute()
+            .get("values", [[]])[0]
+        )
     if not current_headers:
         sheets.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
@@ -455,7 +482,7 @@ def ensure_worksheet(sheets: Any, spreadsheet_id: str, worksheet: str) -> int:
 
 def sync_rows(sheets: Any, spreadsheet_id: str, worksheet: str, new_rows: list[list[Any]]) -> int:
     sheet_id = ensure_worksheet(sheets, spreadsheet_id, worksheet)
-    data_range = quoted_sheet_range(worksheet, "A2:N")
+    data_range = quoted_sheet_range(worksheet, "A2:O")
     existing_rows = (
         sheets.spreadsheets()
         .values()
@@ -467,21 +494,41 @@ def sync_rows(sheets: Any, spreadsheet_id: str, worksheet: str, new_rows: list[l
         .execute()
         .get("values", [])
     )
-    existing_source_keys = {
-        str(row[11]) for row in existing_rows if len(row) > 11 and row[11]
+    existing_row_by_source_key = {
+        str(row[11]): row_number
+        for row_number, row in enumerate(existing_rows, start=2)
+        if len(row) > 11 and row[11]
     }
+    page_link_updates = []
+    for row in new_rows:
+        source_key = str(row[11])
+        existing_row_number = existing_row_by_source_key.get(source_key)
+        if existing_row_number is None:
+            continue
+        existing_row = existing_rows[existing_row_number - 2]
+        existing_link = str(existing_row[14]) if len(existing_row) > 14 else ""
+        new_link = str(row[14]) if len(row) > 14 else ""
+        if new_link and new_link != existing_link:
+            page_link_updates.append(
+                {
+                    "range": quoted_sheet_range(worksheet, f"O{existing_row_number}"),
+                    "values": [[new_link]],
+                }
+            )
     unique_new_rows = [
-        row for row in new_rows if str(row[11]) not in existing_source_keys
+        row for row in new_rows if str(row[11]) not in existing_row_by_source_key
     ]
     flag_updates, prepared_rows = flag_duplicates(existing_rows, unique_new_rows)
+    updates = page_link_updates
     if flag_updates:
-        updates = [
+        updates.extend(
             {
                 "range": quoted_sheet_range(worksheet, f"K{row_number}"),
                 "values": [[flags]],
             }
             for row_number, flags in flag_updates.items()
-        ]
+        )
+    if updates:
         sheets.spreadsheets().values().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"valueInputOption": "RAW", "data": updates},
@@ -489,7 +536,7 @@ def sync_rows(sheets: Any, spreadsheet_id: str, worksheet: str, new_rows: list[l
     if prepared_rows:
         sheets.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
-            range=quoted_sheet_range(worksheet, "A:N"),
+            range=quoted_sheet_range(worksheet, "A:O"),
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": prepared_rows},
@@ -553,6 +600,11 @@ def process_folder(
                         page_number,
                         f"{file_id}:page:{page_number}",
                         file_info.get("webViewLink", ""),
+                        build_document_page_link(
+                            file_info.get("webViewLink", ""),
+                            page_number,
+                            file_info["mimeType"],
+                        ),
                     )
                 except Exception as error:
                     record = parse_receipt_text(
@@ -561,6 +613,11 @@ def process_folder(
                         page_number,
                         f"{file_id}:page:{page_number}",
                         file_info.get("webViewLink", ""),
+                        build_document_page_link(
+                            file_info.get("webViewLink", ""),
+                            page_number,
+                            file_info["mimeType"],
+                        ),
                     )
                     record[10] = add_flag(record[10], f"OCR ERROR: {error}")
                 records.append(record)
@@ -571,6 +628,9 @@ def process_folder(
                 1,
                 f"{file_id}:page:1",
                 file_info.get("webViewLink", ""),
+                build_document_page_link(
+                    file_info.get("webViewLink", ""), 1, file_info["mimeType"]
+                ),
             )
             record[10] = add_flag(record[10], f"FILE ERROR: {error}")
             records.append(record)

@@ -9,6 +9,8 @@ from googleapiclient.errors import HttpError
 
 from receipt_hsa import (
     HEADERS,
+    LEGACY_HEADERS,
+    build_document_page_link,
     extract_amount,
     extract_date,
     extract_page_images,
@@ -16,6 +18,7 @@ from receipt_hsa import (
     normalize_folder_id,
     parse_receipt_text,
     sync_rows,
+    ensure_worksheet,
     validate_drive_folder,
 )
 
@@ -127,6 +130,26 @@ Grand Total $12.50
             "abc_123",
         )
 
+    def test_pdf_page_link_targets_the_receipt_page(self):
+        self.assertEqual(
+            build_document_page_link(
+                "https://drive.google.com/file/d/file-id/view?usp=drivesdk",
+                3,
+                "application/pdf",
+            ),
+            "https://drive.google.com/file/d/file-id/view?usp=drivesdk#page=3",
+        )
+
+    def test_image_page_link_keeps_the_source_url(self):
+        self.assertEqual(
+            build_document_page_link(
+                "https://drive.google.com/file/d/image-id/view#old-fragment",
+                1,
+                "image/jpeg",
+            ),
+            "https://drive.google.com/file/d/image-id/view",
+        )
+
     def test_each_pdf_page_becomes_a_separate_image(self):
         document = pymupdf.open()
         document.new_page()
@@ -173,7 +196,8 @@ Grand Total $12.50
             "",
             "file-a:page:1",
             "OCR text",
-            "",
+            "https://drive.google.com/file/d/file-a/view",
+            "https://drive.google.com/file/d/file-a/view#page=1",
         ]
         new = [
             "2026-04-03",
@@ -189,7 +213,8 @@ Grand Total $12.50
             "",
             "file-b:page:1",
             "OCR text",
-            "",
+            "https://drive.google.com/file/d/file-b/view",
+            "https://drive.google.com/file/d/file-b/view#page=1",
         ]
         sheets = MagicMock()
         api = sheets.spreadsheets.return_value
@@ -199,7 +224,7 @@ Grand Total $12.50
         values_api = api.values.return_value
 
         def get_values(**kwargs):
-            values = [HEADERS] if kwargs["range"] == "'Receipts'!A1:N1" else [existing]
+            values = [HEADERS] if kwargs["range"] == "'Receipts'!A1:O1" else [existing]
             return MagicMock(execute=MagicMock(return_value={"values": values}))
 
         values_api.get.side_effect = get_values
@@ -213,7 +238,7 @@ Grand Total $12.50
             update_body["data"][0]["values"], [["POTENTIAL DUPLICATE"]]
         )
         append_call = values_api.append.call_args.kwargs
-        self.assertEqual(append_call["range"], "'Receipts'!A:N")
+        self.assertEqual(append_call["range"], "'Receipts'!A:O")
         self.assertIn("POTENTIAL DUPLICATE", append_call["body"]["values"][0][10])
         formatting = api.batchUpdate.call_args.kwargs["body"]["requests"]
         self.assertEqual(
@@ -240,7 +265,8 @@ Grand Total $12.50
             "",
             "file-a:page:1",
             "OCR text",
-            "",
+            "https://drive.google.com/file/d/file-a/view",
+            "https://drive.google.com/file/d/file-a/view#page=1",
         ]
         sheets = MagicMock()
         api = sheets.spreadsheets.return_value
@@ -250,7 +276,7 @@ Grand Total $12.50
         values_api = api.values.return_value
 
         def get_values(**kwargs):
-            values = [HEADERS] if kwargs["range"] == "'Receipts'!A1:N1" else [existing]
+            values = [HEADERS] if kwargs["range"] == "'Receipts'!A1:O1" else [existing]
             return MagicMock(execute=MagicMock(return_value={"values": values}))
 
         values_api.get.side_effect = get_values
@@ -259,6 +285,75 @@ Grand Total $12.50
 
         self.assertEqual(added, 0)
         values_api.append.assert_not_called()
+
+    def test_sheet_sync_backfills_page_link_without_appending_duplicate(self):
+        existing_without_page_link = [
+            "2026-04-03",
+            "2026-04-03",
+            "Store",
+            "Item",
+            12.5,
+            "USD",
+            "",
+            "",
+            "a.pdf",
+            2,
+            "",
+            "file-a:page:2",
+            "OCR text",
+            "https://drive.google.com/file/d/file-a/view",
+        ]
+        new = existing_without_page_link + [
+            "https://drive.google.com/file/d/file-a/view#page=2"
+        ]
+        sheets = MagicMock()
+        api = sheets.spreadsheets.return_value
+        api.get.return_value.execute.return_value = {
+            "sheets": [{"properties": {"title": "Receipts", "sheetId": 42}}]
+        }
+        values_api = api.values.return_value
+
+        def get_values(**kwargs):
+            values = (
+                [HEADERS]
+                if kwargs["range"] == "'Receipts'!A1:O1"
+                else [existing_without_page_link]
+            )
+            return MagicMock(execute=MagicMock(return_value={"values": values}))
+
+        values_api.get.side_effect = get_values
+
+        added = sync_rows(sheets, "spreadsheet-id", "Receipts", [new])
+
+        self.assertEqual(added, 0)
+        values_api.append.assert_not_called()
+        update_body = values_api.batchUpdate.call_args.kwargs["body"]
+        self.assertEqual(update_body["data"][0]["range"], "'Receipts'!O2")
+        self.assertEqual(
+            update_body["data"][0]["values"],
+            [["https://drive.google.com/file/d/file-a/view#page=2"]],
+        )
+
+    def test_existing_sheet_gets_new_document_page_link_header(self):
+        sheets = MagicMock()
+        sheets.spreadsheets.return_value.get.return_value.execute.return_value = {
+            "sheets": [{"properties": {"title": "Receipts", "sheetId": 42}}]
+        }
+        values_api = sheets.spreadsheets.return_value.values.return_value
+        values_api.get.side_effect = [
+            MagicMock(execute=MagicMock(return_value={"values": [LEGACY_HEADERS]})),
+            MagicMock(execute=MagicMock(return_value={"values": [HEADERS]})),
+        ]
+
+        sheet_id = ensure_worksheet(sheets, "spreadsheet-id", "Receipts")
+
+        self.assertEqual(sheet_id, 42)
+        values_api.update.assert_called_once_with(
+            spreadsheetId="spreadsheet-id",
+            range="'Receipts'!O1",
+            valueInputOption="RAW",
+            body={"values": [["Document Page Link"]]},
+        )
 
 
 if __name__ == "__main__":
