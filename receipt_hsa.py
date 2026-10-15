@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import io
+import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -64,6 +68,17 @@ TOTAL_LABELS = (
     (re.compile(r"\btotal\b", re.I), 5),
     (re.compile(r"\b(amount\s+paid|charged|payment)\b", re.I), 3),
 )
+RECEIPT_FIELDS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "service_date": {"type": "string"},
+        "receipt_date": {"type": "string"},
+        "provider": {"type": "string"},
+        "description": {"type": "string"},
+    },
+    "required": ["service_date", "receipt_date", "provider", "description"],
+    "additionalProperties": False,
+}
 
 
 def normalize_folder_id(value: str) -> str:
@@ -99,6 +114,18 @@ def extract_date(text: str) -> str:
             except ValueError:
                 continue
     return ""
+
+
+def normalize_model_date(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    candidate = value.strip()
+    try:
+        from datetime import date
+
+        return date.fromisoformat(candidate).isoformat()
+    except ValueError:
+        return extract_date(candidate)
 
 
 def extract_service_date(text: str) -> str:
@@ -220,11 +247,17 @@ def parse_receipt_text(
     source_key: str,
     source_url: str,
     document_page_link: str = "",
+    llm_fields: dict[str, str] | None = None,
 ) -> list[Any]:
     service_date = extract_service_date(text)
     receipt_date = extract_date(text)
     merchant = extract_merchant(text)
     description = extract_description(text, merchant)
+    if llm_fields:
+        service_date = normalize_model_date(llm_fields.get("service_date")) or service_date
+        receipt_date = normalize_model_date(llm_fields.get("receipt_date")) or receipt_date
+        merchant = llm_fields.get("provider", "").strip() or merchant
+        description = llm_fields.get("description", "").strip() or description
     amount, currency = extract_amount(text)
     flags = ""
     if not service_date:
@@ -333,7 +366,94 @@ def ocr_image(data: bytes, language: str) -> str:
         return pytesseract.image_to_string(image, lang=language)
 
 
+def build_ollama_payload(image_data: bytes, ocr_text: str, model: str) -> dict[str, Any]:
+    prompt = (
+        "Extract fields from this single receipt page. Use the image as the source "
+        "of truth and the OCR text only as a reading aid. Return dates as YYYY-MM-DD. "
+        "service_date is the date care was provided, not the payment date. receipt_date "
+        "is the printed transaction/receipt date. provider is the seller or care "
+        "provider, not the patient. description should concisely identify only the "
+        "purchased product or service. Do not include addresses, payment method, "
+        "subtotal, tax, or generic receipt boilerplate. Do not infer missing values; "
+        "use an empty string when a field is absent or ambiguous.\n\n"
+        f"OCR text:\n{ocr_text[:12000]}"
+    )
+    return {
+        "model": model,
+        "stream": False,
+        "format": RECEIPT_FIELDS_SCHEMA,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+                "images": [base64.b64encode(image_data).decode("ascii")],
+            }
+        ],
+        "options": {"temperature": 0, "num_ctx": 8192},
+    }
+
+
+def parse_ollama_fields(content: str) -> dict[str, str]:
+    parsed = json.loads(content)
+    if not isinstance(parsed, dict):
+        raise ValueError("Vision model returned a non-object response.")
+    fields = {}
+    for field_name in ("service_date", "receipt_date", "provider", "description"):
+        value = parsed.get(field_name, "")
+        fields[field_name] = value.strip() if isinstance(value, str) else ""
+    fields["service_date"] = normalize_model_date(fields["service_date"])
+    fields["receipt_date"] = normalize_model_date(fields["receipt_date"])
+    fields["provider"] = fields["provider"][:120]
+    fields["description"] = fields["description"][:240]
+    return fields
+
+
+def ollama_api_base(host: str) -> str:
+    normalized = host.strip().rstrip("/")
+    if not normalized.startswith(("http://", "https://")):
+        normalized = f"http://{normalized}"
+    return normalized
+
+
+def ensure_ollama_model(host: str, model: str) -> None:
+    api_base = ollama_api_base(host)
+    request = urllib.request.Request(f"{api_base}/api/tags")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            available_models = json.load(response).get("models", [])
+    except (OSError, urllib.error.URLError) as error:
+        raise RuntimeError(
+            f"Cannot reach local Ollama at {host}. Start the Ollama app and retry."
+        ) from error
+    if not any(item.get("name") == model for item in available_models):
+        raise RuntimeError(
+            f"Ollama model {model!r} is not installed. Pull it with `ollama pull {model}`."
+        )
+
+
+def ollama_extract_fields(
+    image_data: bytes,
+    ocr_text: str,
+    model: str,
+    host: str,
+) -> dict[str, str]:
+    payload = build_ollama_payload(image_data, ocr_text, model)
+    request = urllib.request.Request(
+        f"{ollama_api_base(host)}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            result = json.load(response)
+    except (OSError, urllib.error.URLError, TimeoutError) as error:
+        raise RuntimeError("Local vision-model request failed.") from error
+    return parse_ollama_fields(result["message"]["content"])
+
+
 def authenticate(credentials_path: Path, token_path: Path) -> Any:
+    from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -343,8 +463,11 @@ def authenticate(credentials_path: Path, token_path: Path) -> Any:
         credentials = Credentials.from_authorized_user_file(str(token_path), SCOPES)
     if not credentials or not credentials.valid:
         if credentials and credentials.expired and credentials.refresh_token:
-            credentials.refresh(Request())
-        else:
+            try:
+                credentials.refresh(Request())
+            except RefreshError:
+                credentials = None
+        if not credentials or not credentials.valid:
             flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), SCOPES)
             credentials = flow.run_local_server(port=0)
         token_path.write_text(credentials.to_json(), encoding="utf-8")
@@ -480,7 +603,13 @@ def ensure_worksheet(sheets: Any, spreadsheet_id: str, worksheet: str) -> int:
     return sheet_id
 
 
-def sync_rows(sheets: Any, spreadsheet_id: str, worksheet: str, new_rows: list[list[Any]]) -> int:
+def sync_rows(
+    sheets: Any,
+    spreadsheet_id: str,
+    worksheet: str,
+    new_rows: list[list[Any]],
+    refresh_existing: bool = False,
+) -> tuple[int, int]:
     sheet_id = ensure_worksheet(sheets, spreadsheet_id, worksheet)
     data_range = quoted_sheet_range(worksheet, "A2:O")
     existing_rows = (
@@ -500,6 +629,7 @@ def sync_rows(sheets: Any, spreadsheet_id: str, worksheet: str, new_rows: list[l
         if len(row) > 11 and row[11]
     }
     page_link_updates = []
+    refreshed_row_numbers: set[int] = set()
     for row in new_rows:
         source_key = str(row[11])
         existing_row_number = existing_row_by_source_key.get(source_key)
@@ -515,6 +645,47 @@ def sync_rows(sheets: Any, spreadsheet_id: str, worksheet: str, new_rows: list[l
                     "values": [[new_link]],
                 }
             )
+        if refresh_existing and "LLM ERROR" not in str(row[10]):
+            for column_index in range(4):
+                new_value = row[column_index]
+                old_value = existing_row[column_index] if len(existing_row) > column_index else ""
+                if new_value and new_value != old_value:
+                    page_link_updates.append(
+                        {
+                            "range": quoted_sheet_range(
+                                worksheet,
+                                f"{chr(ord('A') + column_index)}{existing_row_number}",
+                            ),
+                            "values": [[new_value]],
+                        }
+                    )
+                    refreshed_row_numbers.add(existing_row_number)
+            old_flags = str(existing_row[10]) if len(existing_row) > 10 else ""
+            flags_to_clear = {
+                0: "CHECK SERVICE DATE",
+                1: "CHECK RECEIPT DATE",
+                2: "CHECK PROVIDER",
+                3: "CHECK DESCRIPTION",
+            }
+            updated_flags = [
+                flag
+                for flag in old_flags.split("; ")
+                if flag
+                and not any(
+                    row[column_index] and flag == review_flag
+                    for column_index, review_flag in flags_to_clear.items()
+                )
+            ]
+            updated_flags = [
+                flag for flag in updated_flags if not flag.startswith("LLM ERROR:")
+            ]
+            if updated_flags != old_flags.split("; "):
+                page_link_updates.append(
+                    {
+                        "range": quoted_sheet_range(worksheet, f"K{existing_row_number}"),
+                        "values": [["; ".join(updated_flags)]],
+                    }
+                )
     unique_new_rows = [
         row for row in new_rows if str(row[11]) not in existing_row_by_source_key
     ]
@@ -574,13 +745,15 @@ def sync_rows(sheets: Any, spreadsheet_id: str, worksheet: str, new_rows: list[l
             ]
         },
     ).execute()
-    return len(prepared_rows)
+    return len(prepared_rows), len(refreshed_row_numbers)
 
 
 def process_folder(
     drive: Any,
     root_folder_id: str,
     language: str,
+    model: str,
+    ollama_host: str,
 ) -> list[list[Any]]:
     records: list[list[Any]] = []
     for file_info in list_drive_files(drive, root_folder_id):
@@ -592,34 +765,36 @@ def process_folder(
             for page_number, page_image in enumerate(
                 extract_page_images(file_data, file_info["mimeType"]), start=1
             ):
+                ocr_error = None
                 try:
                     text = ocr_image(page_image, language)
-                    record = parse_receipt_text(
-                        text,
-                        name,
-                        page_number,
-                        f"{file_id}:page:{page_number}",
-                        file_info.get("webViewLink", ""),
-                        build_document_page_link(
-                            file_info.get("webViewLink", ""),
-                            page_number,
-                            file_info["mimeType"],
-                        ),
+                except Exception as error:
+                    text = ""
+                    ocr_error = error
+                llm_error = None
+                try:
+                    llm_fields = ollama_extract_fields(
+                        page_image, text, model, ollama_host
                     )
                 except Exception as error:
-                    record = parse_receipt_text(
-                        "",
-                        name,
-                        page_number,
-                        f"{file_id}:page:{page_number}",
-                        file_info.get("webViewLink", ""),
-                        build_document_page_link(
-                            file_info.get("webViewLink", ""),
-                            page_number,
-                            file_info["mimeType"],
-                        ),
-                    )
-                    record[10] = add_flag(record[10], f"OCR ERROR: {error}")
+                    llm_fields = None
+                    llm_error = error
+                source_url = file_info.get("webViewLink", "")
+                record = parse_receipt_text(
+                    text,
+                    name,
+                    page_number,
+                    f"{file_id}:page:{page_number}",
+                    source_url,
+                    build_document_page_link(
+                        source_url, page_number, file_info["mimeType"]
+                    ),
+                    llm_fields,
+                )
+                if ocr_error:
+                    record[10] = add_flag(record[10], f"OCR ERROR: {type(ocr_error).__name__}")
+                if llm_error:
+                    record[10] = add_flag(record[10], f"LLM ERROR: {type(llm_error).__name__}")
                 records.append(record)
         except Exception as error:
             record = parse_receipt_text(
@@ -667,6 +842,21 @@ def main() -> int:
         default=os.getenv("TESSERACT_CMD"),
         help="Optional path to the Tesseract executable (or TESSERACT_CMD).",
     )
+    parser.add_argument(
+        "--model",
+        default=os.getenv("OLLAMA_MODEL", "qwen3-vl:4b"),
+        help="Local Ollama vision model name (or OLLAMA_MODEL).",
+    )
+    parser.add_argument(
+        "--ollama-host",
+        default=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
+        help="Local Ollama API address (or OLLAMA_HOST).",
+    )
+    parser.add_argument(
+        "--refresh-extracted",
+        action="store_true",
+        help="Update extracted dates, provider, and description on existing receipt pages.",
+    )
     args = parser.parse_args()
     if not args.folder or not args.sheet:
         parser.error("--folder and --sheet are required (or set their environment variables).")
@@ -680,15 +870,26 @@ def main() -> int:
             import pytesseract
 
             pytesseract.pytesseract.tesseract_cmd = args.tesseract_cmd
+        ensure_ollama_model(args.ollama_host, args.model)
         credentials = authenticate(Path(args.credentials), Path(args.token))
         drive, sheets = build_services(credentials)
         validate_drive_folder(drive, folder_id)
-        records = process_folder(drive, folder_id, args.language)
-        added = sync_rows(sheets, spreadsheet_id, args.worksheet, records)
+        records = process_folder(
+            drive, folder_id, args.language, args.model, args.ollama_host
+        )
+        added, refreshed = sync_rows(
+            sheets,
+            spreadsheet_id,
+            args.worksheet,
+            records,
+            refresh_existing=args.refresh_extracted,
+        )
     except Exception as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
-    print(f"Done. Added {added} receipt page(s); existing source pages were skipped.")
+    print(
+        f"Done. Added {added} receipt page(s); refreshed {refreshed} existing page(s)."
+    )
     return 0
 
 

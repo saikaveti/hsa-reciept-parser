@@ -1,8 +1,11 @@
 import io
 import unittest
+import tempfile
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+import base64
+from unittest.mock import MagicMock, patch
 
 import pymupdf
 from googleapiclient.errors import HttpError
@@ -10,13 +13,17 @@ from googleapiclient.errors import HttpError
 from receipt_hsa import (
     HEADERS,
     LEGACY_HEADERS,
+    authenticate,
     build_document_page_link,
+    build_ollama_payload,
     extract_amount,
     extract_date,
     extract_page_images,
     flag_duplicates,
     normalize_folder_id,
+    ollama_api_base,
     parse_receipt_text,
+    parse_ollama_fields,
     sync_rows,
     ensure_worksheet,
     validate_drive_folder,
@@ -24,6 +31,40 @@ from receipt_hsa import (
 
 
 class ReceiptParsingTests(unittest.TestCase):
+    def test_revoked_oauth_token_falls_back_to_browser_authorization(self):
+        from google.auth.exceptions import RefreshError
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            token_path = Path(temp_dir) / "token.json"
+            expired_credentials = MagicMock(
+                valid=False,
+                expired=True,
+                refresh_token="refresh-token",
+            )
+            expired_credentials.refresh.side_effect = RefreshError("invalid_grant")
+            new_credentials = MagicMock(
+                valid=True,
+                to_json=MagicMock(return_value='{"valid": true}'),
+            )
+            flow = MagicMock()
+            flow.run_local_server.return_value = new_credentials
+
+            with (
+                patch(
+                    "google.oauth2.credentials.Credentials.from_authorized_user_file",
+                    return_value=expired_credentials,
+                ),
+                patch(
+                    "google_auth_oauthlib.flow.InstalledAppFlow.from_client_secrets_file",
+                    return_value=flow,
+                ),
+            ):
+                credentials = authenticate(Path(temp_dir) / "credentials.json", token_path)
+
+            self.assertIs(credentials, new_credentials)
+            flow.run_local_server.assert_called_once_with(port=0)
+            self.assertEqual(token_path.read_text(encoding="utf-8"), '{"valid": true}')
+
     def test_extracts_date_and_total_instead_of_subtotal(self):
         text = """Northside Pharmacy
 2026-04-03
@@ -62,6 +103,53 @@ Grand Total $12.50
 
         self.assertEqual(row[12], "Clinic\nTotal $20.00")
         self.assertEqual(row[13], "https://drive.google.com/file/d/file-1/view")
+
+    def test_model_fields_improve_description_and_provider_but_preserve_amount(self):
+        fields = {
+            "service_date": "2026-04-02",
+            "receipt_date": "2026-04-03",
+            "provider": "Northside Pharmacy",
+            "description": "Prescription medication",
+        }
+        row = parse_receipt_text(
+            "NORTHSIDE PHARMACY\n2026-04-03\nRx 12.50\nTotal $12.50",
+            "receipt.pdf",
+            1,
+            "file-id:page:1",
+            "https://drive.google.com/file/d/file-id/view",
+            llm_fields=fields,
+        )
+
+        self.assertEqual(row[0], "2026-04-02")
+        self.assertEqual(row[2], "Northside Pharmacy")
+        self.assertEqual(row[3], "Prescription medication")
+        self.assertEqual(row[4], 12.5)
+
+    def test_ollama_response_fields_are_normalized(self):
+        fields = parse_ollama_fields(
+            '{"service_date":"Apr 2, 2026","receipt_date":"2026-04-03",'
+            '"provider":" Clinic ","description":" Office visit "}'
+        )
+
+        self.assertEqual(fields["service_date"], "2026-04-02")
+        self.assertEqual(fields["receipt_date"], "2026-04-03")
+        self.assertEqual(fields["provider"], "Clinic")
+        self.assertEqual(fields["description"], "Office visit")
+
+    def test_ollama_host_accepts_standard_windows_host_value(self):
+        self.assertEqual(ollama_api_base("127.0.0.1:11434"), "http://127.0.0.1:11434")
+        self.assertEqual(
+            ollama_api_base("http://127.0.0.1:11434/"),
+            "http://127.0.0.1:11434",
+        )
+
+    def test_ollama_payload_includes_page_image_and_json_schema(self):
+        payload = build_ollama_payload(b"page-image", "OCR aid", "qwen3-vl:4b")
+
+        self.assertEqual(payload["model"], "qwen3-vl:4b")
+        self.assertEqual(base64.b64decode(payload["messages"][0]["images"][0]), b"page-image")
+        self.assertEqual(payload["format"]["type"], "object")
+        self.assertIn("OCR aid", payload["messages"][0]["content"])
 
     def test_unknown_merchant_is_flagged(self):
         row = parse_receipt_text("", "scan.png", 1, "file-2:page:1", "")
@@ -231,7 +319,7 @@ Grand Total $12.50
 
         added = sync_rows(sheets, "spreadsheet-id", "Receipts", [new])
 
-        self.assertEqual(added, 1)
+        self.assertEqual(added, (1, 0))
         update_body = values_api.batchUpdate.call_args.kwargs["body"]
         self.assertEqual(update_body["data"][0]["range"], "'Receipts'!K2")
         self.assertEqual(
@@ -283,7 +371,7 @@ Grand Total $12.50
 
         added = sync_rows(sheets, "spreadsheet-id", "Receipts", [existing])
 
-        self.assertEqual(added, 0)
+        self.assertEqual(added, (0, 0))
         values_api.append.assert_not_called()
 
     def test_sheet_sync_backfills_page_link_without_appending_duplicate(self):
@@ -325,7 +413,7 @@ Grand Total $12.50
 
         added = sync_rows(sheets, "spreadsheet-id", "Receipts", [new])
 
-        self.assertEqual(added, 0)
+        self.assertEqual(added, (0, 0))
         values_api.append.assert_not_called()
         update_body = values_api.batchUpdate.call_args.kwargs["body"]
         self.assertEqual(update_body["data"][0]["range"], "'Receipts'!O2")
@@ -333,6 +421,55 @@ Grand Total $12.50
             update_body["data"][0]["values"],
             [["https://drive.google.com/file/d/file-a/view#page=2"]],
         )
+
+    def test_refresh_updates_extracted_fields_not_amount_or_manual_fields(self):
+        existing = [
+            "",
+            "2026-04-03",
+            "Old pharmacy guess",
+            "Old item guess",
+            12.5,
+            "USD",
+            "Patient-entered",
+            "Category-entered",
+            "a.pdf",
+            1,
+            "CHECK SERVICE DATE",
+            "file-a:page:1",
+            "OCR text",
+            "https://drive.google.com/file/d/a/view",
+            "https://drive.google.com/file/d/a/view#page=1",
+        ]
+        new = existing.copy()
+        new[0] = "2026-04-02"
+        new[2] = "Northside Pharmacy"
+        new[3] = "Prescription medication"
+        sheets = MagicMock()
+        api = sheets.spreadsheets.return_value
+        api.get.return_value.execute.return_value = {
+            "sheets": [{"properties": {"title": "Receipts", "sheetId": 42}}]
+        }
+        values_api = api.values.return_value
+
+        def get_values(**kwargs):
+            values = [HEADERS] if kwargs["range"] == "'Receipts'!A1:O1" else [existing]
+            return MagicMock(execute=MagicMock(return_value={"values": values}))
+
+        values_api.get.side_effect = get_values
+
+        result = sync_rows(
+            sheets, "spreadsheet-id", "Receipts", [new], refresh_existing=True
+        )
+
+        self.assertEqual(result, (0, 1))
+        update_data = values_api.batchUpdate.call_args.kwargs["body"]["data"]
+        updates = {item["range"]: item["values"][0][0] for item in update_data}
+        self.assertEqual(updates["'Receipts'!A2"], "2026-04-02")
+        self.assertEqual(updates["'Receipts'!C2"], "Northside Pharmacy")
+        self.assertEqual(updates["'Receipts'!D2"], "Prescription medication")
+        self.assertNotIn("'Receipts'!E2", updates)
+        self.assertNotIn("'Receipts'!G2", updates)
+        self.assertNotIn("'Receipts'!H2", updates)
 
     def test_existing_sheet_gets_new_document_page_link_header(self):
         sheets = MagicMock()
